@@ -1,0 +1,660 @@
+<html>
+<head><title>The Mail and Notification packages</title></head>
+<body>
+
+<h3>Table Of Contents</h3>
+
+<p>
+<ul>
+  <li><a href="#overview">Overview</a>
+    <ul>
+      <li><a href="#tools">Available Tools</a><li>
+      <li><a href="#solution">Solution Outline</a><li>     
+    </ul></li>
+  <li><a href="#mail">The Mail Package</a></li>
+  <li><a href="#nt">The Notification Package</a>
+    <ul>
+      <li><a href="#quick">Quick Start</a> - <b>jump here if you simply
+           want to use the package !</b></li>       
+      <li><a href="#api">User API</a></li>           
+      <li><a href="#inner">Inner Workings</a>
+        <ul>
+          <li><a href="#process">The process_queue Procedure</a></li>           
+          <li><a href="#expand">The expand_requests Procedure</a></li>           
+          <li><a href="#update">The update_requests Procedure</a></li>           
+        </ul></li>
+    </ul></li>
+  <li><a href="#future">Future Work</a></li>           
+  <li><a href="#conclusion">Conclusion</a></li>
+</ul>
+</p>
+
+<h3><a name="overview">Overwiew</a></h3>
+
+    <p>Jin Choi has provided a thorough <a href="http://www.arsdigita.com/asj/webmail/">
+solution</a> for Web-based email. However, sometimes it is desirable to implement a
+simpler solution, which could be automated and fully encapsulated with PL/SQL
+procedures. For instance, imagine a workflow manager module. The module needs to
+notify a user when someone assigns him/her/it a task, such as
+&quot;Edit the Little Red Riding Hood article by 9:00 tomorro&quot;. It would
+be nice to issue a one-line PL/SQL call that would automatically notify the
+user, without placing an undue burden on the calling PL/SQL script. Additionally,
+when an entire group (such as &quot;Tech Support&quot;) needs to be notified,
+the notification should automatically and transparently be sent to each member
+of the group.</p>
+
+<h4><a name="tools">Available Tools</a></h4>
+
+    Oracle provides a low-level package,
+<a href="http://oradoc.photo.net/ora816/server.816/a76936/utl_smtp.htm#1000695">
+utl_smtp</a>, which implements the SMTP protocol, with some minor bugs. The
+new &quot;parties&quot; data model in ACS 4.0 (still in development) provides
+support for generalized <em>parties</em>, who can be users or groups. Any party
+may be a member of any other party; thus, the user Bob can be a member of
+the group Accounting, which in turn is a member of the Acme Corporation.
+Another package supplied by Oracle,
+<a href="http://oradoc.photo.net/ora816/server.816/a76936/dbms_job.htm#999107">
+dbms_job</a>, provides the means to schedule some PL/SQL code to run at regular
+intervals.
+
+<h4><a name="solution">Solution Outline</a></h4>
+
+    <p>Two packages were developed as the solution to the problem. The low-level
+package <tt>mail</tt> encapsulates Oracle's utl_smtp, fixing some minor bugs
+and providing simplified APIs. The high-level package <tt>nt</tt> provides
+a queue of notification requests. This queue is periodically scanned by the
+package. First, new requests are analyzed and their groups are broken up
+into individual users. Second, a summary notification is created for each
+sender/recepient pair; for example, if John has notified Bob three times since
+the last time the queue was scanned, Bob will receive a single email message
+with all three notifications in it. Finally, the compiled notifications are
+sent through SMTP. If the SMTP call fails for some reason, the error code is noted
+and the notification is deferred until the next processing of the queue.
+Of course, if the SMTP call continues to fail, the notification module will eventually
+give up.</p>
+
+
+<h3><a name="mail">The Mail Package</a></h3>
+
+    <p>The package follows the SMTP protocol, as described in RFC821. In order to
+send mail, the user must first open a connection. If the conenction is opened
+successfully, the user must specify the sender and the recepient of the e-mail
+message:
+
+<blockquote>
+<pre><tt>
+create or replace package mail
+is
+
+-- Open the connection and send "helo me"
+function open_connection (
+  host       IN varchar2,
+  port       IN pls_integer,
+  mail_conn  OUT NOCOPY utl_smtp.connection
+) return utl_smtp.reply;
+
+-- Send the "mail from:" command
+function mail_from (
+  mail_conn  IN OUT NOCOPY utl_smtp.connection,
+  email_from IN varchar2
+) return utl_smtp.reply;
+
+-- Send the "rcpt to:" command; forward if neccessary
+function rcpt_to (
+  mail_conn  IN OUT NOCOPY utl_smtp.connection,
+  email_to   IN varchar2
+) return utl_smtp.reply;
+</tt></pre>
+...
+</blockquote>
+
+After that, the user may write any data he wishes into the connection,
+terminating the data with a single period at the beggining of a new line.
+The user may then close the connection, or start a new message:
+
+<blockquote>
+...
+<pre><tt>
+-- Open up the data connection, prepare for the writing of data
+function open_data (
+  mail_conn  IN OUT NOCOPY utl_smtp.connection
+) return utl_smtp.reply;
+
+-- Convert a date into email date format (GMT)
+function to_email_date (
+  ora_date IN date
+) return varchar2;
+
+-- Write outgoing headers (date:, to:, from:, subject)
+procedure write_data_headers (
+  mail_conn  IN OUT NOCOPY utl_smtp.connection,
+  email_from IN varchar2,
+  email_to   IN varchar2,
+  subject    IN varchar2,
+  date_sent  IN date default sysdate
+);
+
+-- Write a clob into the mail data connection, in chunks
+procedure write_data_clob (
+  mail_conn IN OUT NOCOPY utl_smtp.connection,
+  clob_loc  IN OUT NOCOPY clob
+);
+
+-- Write a string into the mail data connection
+procedure write_data_string (
+  mail_conn IN OUT NOCOPY utl_smtp.connection,
+  text_string    IN varchar2
+);
+
+-- Close the data connection
+function close_data (
+  mail_conn  IN OUT NOCOPY utl_smtp.connection
+) return utl_smtp.reply;
+
+-- Close the connection, finish mail session
+procedure close_connection (
+  mail_conn  IN OUT NOCOPY utl_smtp.connection
+);
+</tt></pre>
+...
+</blockquote>
+
+A simplified function <tt>send_mail</tt> takes care of all these tasks in
+one call:
+
+<blockquote>
+...
+<pre><tt>
+-- A simple procedure to send an entire mail message
+-- return 't' on success, 'f' on failure
+function send_mail (
+  email_from IN varchar2,
+  email_to   IN varchar2,
+  subject    IN varchar2,
+  text       IN varchar2,
+  host       IN varchar2,
+  port       IN pls_integer := 25
+) return char;
+</tt></pre>
+</blockquote>
+</p>
+
+    <p>The implementation of these functions is fairly straightforward. The <tt>mail_from</tt>
+and the <tt>rcpt_to</tt> functions correct the bug in <tt>utl_smtp</tt> (a missing
+&quot;:&quot; after the command); in addition, <tt>rcpt_to</tt> attempts to parse
+out a forwarding address if the mail server requestes the client to manually forward the
+mail to a different address. The <tt>write_data_headers</tt> procedure writes some common
+SMTP headers, including the subject line. The simplified function <tt>send_mail</tt>
+sends an entire message, keeping track of the error codes, and returns a boolean
+value to indicate success or failure.</p>
+
+<h3><a name="nt">The Notification Package</a></h3>
+
+  <p>The Notification package builds on top of the Mail package to provide a
+notification queue and automatic integration with the ACS 4.0 parties data model.
+</p>
+
+<h4><a name="quick">Quick Start (see below for details)</a></h4>
+
+    <p>To quickly start using the notification package, execute the following:
+<ol>
+<li>Schedule the processing of the request queue: 
+<blockquote><pre><tt>
+exec nt.process_queue('mail.mymailserver.com');
+</tt></pre></blockquote></li>
+<li>Post a notification request: 
+<blockquote><pre><tt>
+declare
+  request_id nt_requests.request_id%TYPE;
+begin
+  request_id := nt.post_request (
+    party_from =&gt; <em>sending_party_id</em>,
+    party_to =&gt; <em>recepient_party_id</em>,
+    expand_group =&gt; 'f',
+    subject =&gt; 'This is a notification',
+    message =&gt; 'Hello world !');
+end;
+/
+</tt></pre></blockquote>
+You can reuse the returned <tt>request_id</tt> later, 
+in case you wish to cancel the request.</li>
+</ol>
+</p>
+
+<h4><a name="api">User API, in detail</a></h4>
+
+    <p>The package uses a data model which consists of two queues: the request queue
+<tt>nt_requests</tt> and the message queue <tt>nt_queue</tt>.
+
+<blockquote>
+<pre><tt>
+
+create table nt_requests (
+  -- Unique request id
+  request_id    integer           constraint nt_request_pk
+                                  primary key,
+  -- The party to whom this message is being sent
+  party_to      integer not null  constraint nt_request_party_to_ref
+		                  references parties,
+  -- If the target party is a group, do we completely flatten
+  -- it, thus sending email to individual users, or do we send the
+  -- email to the group if it has an email address ?
+  expand_group char(1) default 'f' not null
+    constraint nt_request_expand_chk check(expand_group in ('t', 'f')),
+  -- The party who is sending this message
+  -- Doesn't really have to have an email field... ?
+  party_from    integer not null  constraint nt_request_party_from_ref
+		                  references parties,
+  -- The message that will be sent
+  message       clob,
+  -- One line of subject text for the message
+  subject       varchar2(1000),
+  -- The date on which the posting to the queue was made
+  request_date  date              default sysdate,
+  -- The date on which the request was fulfilled
+  fulfill_date  date,
+  -- The status of the request
+  -- pending: no attempt made to send it yet
+  -- sent:    sent successfully
+  -- sending: an attempt to send the request has been made, but not all of
+  --          the users in the target group have been reached
+  -- partial_failure: some of the messages went through, others we gave up on
+  -- failed:  check the error_code and error_message columns
+  -- cancelled: request was aborted
+  status        varchar2(20)      default 'pending'
+                                  constraint nt_request_status_chk
+  check(status in ('pending', 'sent', 'sending', 'partial_failure', 'failed', 'cancelled')),
+  -- How many times will we try to send this message ?
+  max_retries integer default 3   not null
+);
+
+create sequence nt_request_seq start with 1000;
+
+-- The table that holds all the neccessary SMTP information for individual
+-- users
+
+create table nt_queue (
+  -- Request id
+  request_id    integer           constraint nt_queue_request_ref
+		                  references nt_requests,
+  -- The individual user to whom email is being sent
+  -- Not neccessarily the same as nt_requests.party_id
+  party_to      integer           constraint nt_queue_party_to_ref
+                                  references parties,
+  -- Composite primary key
+  primary key(request_id, party_to),
+  -- SMTP reply code (250 means ok)
+  smtp_reply_code integer,
+  -- SMTP text reply message
+  smtp_reply_message varchar2(4000),
+  -- How many times have we already tried to send this message ?
+  retry_count   integer default 0 not null,
+  -- Did we succeed in sending this message ?
+  -- This is really just syntactic sugar, since we can just look at the
+  -- smtp_reply_code
+  is_successful char(1) default 'f' not null
+    constraint nt_queue_is_successful_chk
+    check (is_successful in ('t', 'f'))
+);
+
+</tt></pre>
+</blockquote></p>
+
+    <p>Requests are posted to the <tt>nt_requests</tt> queue by the user, with
+the status of &quot;pending&quot;. Eventually, each
+request is <em>expanded</em>; that is, an entry in the <tt>nt_queue</tt> table
+is generated for each intended recepient of the notification. For example, if
+John decides to send a memo to Accounting, a group which has 5 members, only
+one entry will be generated in the <tt>nt_requests</tt> table, but 5 entries will
+be generated in the <tt>nt_queue</tt> table. John may, however, choose to set the
+<tt>expand_group</tt> flag in the <tt>nt_requests</tt> table to false, in which
+case only one entry will be generated in the <tt>nt_queue</tt> table, and the
+notification will be sent to &quot;accounting@arsdigita.com&quot;, or something
+similar. The status of the request is then changed to &quot;sending&quot;. Eventually,
+the status will be changed to &quot;sent&quot, if everyone in Accounting has
+received John's message, or to &quot;partial_failure&quot;, if some members of
+Accounting could not receive the message. In the rare event of a total failure
+(for example, this can happen if the mail server goes down), the status will
+be changed to &quot;failed&quot;.</p>
+
+    <p>To simplify the posting of requests, the package provides the following
+functions:
+
+<blockquote>
+<pre><tt>
+-- Post a new request, return its id
+function post_request (
+  party_from   IN nt_requests.party_from%TYPE,
+  party_to     IN nt_requests.party_to%TYPE,
+  expand_group IN nt_requests.expand_group%TYPE,
+  subject      IN nt_requests.subject%TYPE,
+  message      IN varchar2,
+  max_retries  IN nt_requests.max_retries%TYPE
+) return nt_requests.request_id%TYPE;
+
+-- Cancel a request, marking all messages in the queue as failed
+procedure cancel_request (
+  request_id IN nt_requests.request_id%TYPE
+);
+</pre>
+</blockquote>
+
+These functions simply encapsulate an insert statement and an update statement,
+respectively.</p>
+
+<h4><a name="inner">Inner Workings</a></h4>
+
+    <P>The procedure <tt>process_queue</tt> takes care of fulfilling the requests
+on the <tt>nt_requests</tt> queue. It must be scheduled to run at regular time
+intervals (for example, every hour) using the <tt>schedule_process</tt> call:
+
+<blockquote>
+<pre>
+-- This procedure will be run periodically by DBMS_JOB.
+-- It will collect the pending requests, expand them if neccessary, and
+-- then email them to the parties.
+procedure process_queue (
+  host IN varchar2,
+  port IN pls_integer default 25
+);
+
+-- Schedule the queue to be processed at a regular interval
+-- The interval is the number of minutes between each job run
+-- If the interval is null, cancels the job.
+procedure schedule_process (
+  interval_in IN number,
+  host IN varchar2,
+  port IN integer default 25
+);
+</tt></pre>
+</blockquote>
+
+The job id returned by <tt>dbms_job</tt> package is saved in a special table,
+to make sure that the job is not accidentally scheduled to run twice:
+
+<blockquote>
+<pre><tt>
+
+-- This table keeps track of the job id for scheduling the queue
+-- processing, and some miscellaneous statistics
+create table nt_job (
+  job_id        integer,
+  last_run_date date
+);
+
+insert into nt_job (job_id, last_run_date) values (null, null);
+
+-- Make sure that only one value can exist in the nt_job table
+create or replace trigger nt_job_tr
+before insert or delete on nt_job
+begin
+  raise_application_error(-20000,
+    'Table nt_job must have exactly one row.'
+  );
+end;
+/
+show errors
+
+</tt></pre>
+</blockquote>
+
+</p>
+
+<h4><a name="process">The <tt>process_queue</tt> procedure</a></h4>
+
+    <p>At the heart of the procedure is a cursor loop, which loops through each
+message on the <tt>nt_queue</tt> table which still has a hope of being sent
+out. Messages being sent to parties who have no emails are simply ignored,
+since there isn't a practical way of ever delivering them; messages which belong
+to cancelled or failed requests are also ignored (at this point they are merely
+parts of an audit trail). Similarly, messages which have been retried too many
+times are also ignored.
+
+<blockquote>
+<pre><tt>
+
+procedure process_queue (
+  host IN varchar2,
+  port IN pls_integer default 25
+)
+is
+  v_mail_conn utl_smtp.connection;
+  v_mail_reply utl_smtp.reply;
+
+  -- Cursor that loops through individual messages, processing them
+  -- Only look at the messages which still have a chance of being sent out
+  cursor c_queue_cur is
+    select
+      q.party_to, q.retry_count, q.is_successful,
+      r.party_from, r.message, r.subject, r.request_date,
+      mail.to_email_date(r.request_date) as pretty_request_date,
+      r.max_retries, r.request_id,
+      acs.get_object_pretty_name(q.party_to) name_to,
+      pto.email as email_to,
+      acs.get_object_pretty_name(r.party_from) name_from,
+      pfrom.email as email_from
+    from
+      nt_queue q, nt_requests r, parties pto, parties pfrom
+    where
+      q.is_successful <> 't'
+    and
+      q.request_id = r.request_id
+    and
+      pfrom.party_id = r.party_from
+    and
+      pto.party_id = q.party_to
+    and
+      pto.email is not null
+    and
+      q.retry_count < r.max_retries
+    and
+      r.status = 'sending'
+    order by
+      r.party_from, q.party_to;
+
+  c_queue_row c_queue_cur%ROWTYPE;
+
+  v_old_party_from parties.party_id%TYPE := -1;
+  v_old_party_to parties.party_id%TYPE := -1;
+  v_ready_for_data char(1) := 'f';
+  v_newline varchar2(10) := '
+';
+
+  message_failed exception;
+  v_num_requests integer;
+
+begin
+
+</tt></pre>
+...
+</blockquote>
+</p>
+
+    <p>The procedure sorts <tt>nt_queue</tt> by sender and recepient; 
+this ensures that all messages from the same sender to the same recepient
+will appear consecutively. For example, if John repeatedly notifies
+Alice, Bob and Cindy, the procedure will extract messages in the following
+order:
+
+<table>
+  <tr><th>From</th><th>To</th><th>Message</th></tr>
+  <tr><td>John</td><td>Alice</td><td>2</td></tr>
+  <tr><td>John</td><td>Alice</td><td>3</td></tr>
+  <tr><td>John</td><td>Alice</td><td>6</td></tr>
+  <tr><td>John</td><td>Bob</td><td>4</td></tr>
+  <tr><td>John</td><td>Bob</td><td>5</td></tr>
+  <tr><td>John</td><td>Cindy</td><td>1</td></tr>
+  <tr><td colspan=3 align=center> ...</td></tr>
+</table>
+
+After the messages have been arranged in such blocks, the program only
+needs to keep track of the current sender and recepient. As long as none
+of them change, the program keeps appending to its e-mail data. When the
+sender or the recepient changes, the program closes the data, initializes
+a new e-mail message, and repeats the process.
+
+<blockquote>
+...
+<pre><tt>
+
+  for c_queue_row in c_queue_cur loop
+
+    begin
+ 
+      if v_ready_for_data = 't' and 
+         (c_queue_row.party_from <> v_old_party_from or 
+	  c_queue_row.party_to <> v_old_party_to) then
+	  -- Close old connection, if any
+	  v_mail_reply := mail.close_data(v_mail_conn);
+	  v_ready_for_data := 'f';
+      end if;
+
+      -- Prepare to send data, if neccessary
+      if v_ready_for_data <> 't' then
+
+	-- Set up the sender
+        if c_queue_row.email_from is not null then              
+          v_mail_reply := mail.mail_from(v_mail_conn, c_queue_row.email_from);
+        else
+          v_mail_reply := mail.mail_from(v_mail_conn, 'unknown@unknown.com');
+        end if;
+	if v_mail_reply.code <> 250 then
+          raise message_failed;
+	end if;
+	-- Set up the recepient
+	v_mail_reply := mail.rcpt_to(v_mail_conn, c_queue_row.email_to);
+	if v_mail_reply.code not in (250, 251) then
+          raise message_failed;
+	end if;
+	-- Prepare to write data
+	v_mail_reply := mail.open_data(v_mail_conn);
+
+	-- Write headers
+	mail.write_data_headers (
+	  v_mail_conn, 
+	  c_queue_row.email_from, c_queue_row.email_to, 
+	  c_queue_row.subject, c_queue_row.request_date
+	);
+
+	v_ready_for_data := 't';
+
+      end if;
+
+      -- Once we have a working connection, write into it
+      mail.write_data_string(
+        v_mail_conn, 
+        v_newline ||'Message sent on ' || c_queue_row.pretty_request_date || 
+        ' regarding ' || c_queue_row.subject || v_newline);
+
+      mail.write_data_clob(v_mail_conn, c_queue_row.message);
+
+      -- Success: mark this entry and go on to the next one
+      update nt_queue set 
+	is_successful = 't'
+      where 
+	request_id = c_queue_row.request_id
+      and
+	party_to = c_queue_row.party_to;
+
+</tt></pre>
+...
+</blockquote>
+
+If a failure occurs, the program stores the error code in the <tt>nt_queue</tt>
+table, and goes on to the next message. Ideally, it should determine if the mail
+connection is still intact and reopen the connection if neccessary; however, this
+is not done at this time.
+
+<blockquote>
+...
+<pre><tt>
+
+    exception 
+      when utl_smtp.transient_error or 
+           utl_smtp.permanent_error or 
+           message_failed 
+      then  
+
+      -- Error sending mail: register that an error has occurred, go on to the next message
+      update nt_queue set
+        is_successful = 'f', retry_count = retry_count + 1,
+        smtp_reply_code = v_mail_reply.code,
+        smtp_reply_message = v_mail_reply.text
+      where 
+	request_id = c_queue_row.request_id
+      and
+	party_to = c_queue_row.party_to;
+
+      -- Just in case, close the data connection
+      if v_ready_for_data = 't' then
+        v_mail_reply := mail.close_data(v_mail_conn);
+        v_ready_for_data := 'f';
+      end if;
+
+    end;    
+
+</tt></pre>
+...
+</blockquote>
+</p>
+
+<h4><a name="expand">The <tt>expand_requests</tt> Procedure</a></h4>
+
+<p>This procedure recursively expands the recepient parties, 
+generating a row in the <tt>nt_queue</tt> table for each
+end user in the party. For example, if the org-chart for the
+Accounting department looks as following,
+<ul>
+<li>Accounting
+  <ul>
+    <li>Alice</li>
+    <li>Bob</li>
+    <li>Spelling Committee
+      <ul>
+        <li>Cindy</li>
+        <li>Donovan</li>
+      </ul>
+    </li>
+  </ul>
+</li>
+</ul>
+then a request addressed to Accounting will be expanded into
+4 messages, to Alice, Bob, Cindy and Donovan. </p>
+    <p>This is accomplished by running a <tt>connect by</tt>
+query on the parties data model, and applying the insert DML statement
+only to the leaves in the tree.</p>
+
+<h4><a name="update">The <tt>update_requests</tt> Procedure</a></h4>
+
+    <p>This procedure scans the <tt>nt_queue</tt> table to determine
+the new status of a request in progress (i.e., a request whose
+status is &quot;sending&quot;), in the following order:
+<ul>
+<li>If all the messages into which the request was expanded were
+successfully sent, the status is changed to &quot;sent&quot;.</li>
+<li>If some of the requests have failed, but can still be retried,
+the status remains as &quot;sending&quot;.</li>
+<li>If some of the messages have failed, and cannot be retried,
+the status is set to &quot;partial_failure&quot;.</li>
+<li>If all of the messages have failed, and cannot be retried, the
+status is set to &quot;failed&quot;</li>
+</ul>
+</p>
+
+<h3><a name="future">Future Work</a></h3>
+
+    <p>The <tt>mail</tt> package needs to be made smarter so that it could 
+deal with various SMTP errors and send HTML-formatted messages. The notification
+package needs to be optimized so that it updates requests in a faster
+manner and recovers from errors more gracefully.</p>
+
+<h3><a name="conclusion">Conclusion</a></h3>
+
+  <p>The <tt>mail</tt> package provides a quick-and dirty solution for sending
+mail from Oracle, with a single PL/SQL call to <tt>send_mail</tt>. The
+<tt>notification</tt> package builds on top of the <tt>mail</tt> package
+to provide support for queued notifications which can be sent to their
+recepients in a batch, and in the background.</p>
+
+</body>
+</html>
