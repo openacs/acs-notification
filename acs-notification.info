@@ -5,6 +5,7 @@
     <package-name>ACS Notification</package-name>
     <pretty-plural>ACS Notifications</pretty-plural>
     <singleton-p>t</singleton-p>
+    <initial-install-p>t</initial-install-p>
 
     <version name="4.0" url="http://www.arsdigita.com/acs-repository/download/apm/acs-notification-4.0.apm">
     <database-support>
